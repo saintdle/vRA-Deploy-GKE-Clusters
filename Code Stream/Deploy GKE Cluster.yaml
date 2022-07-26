@@ -1,9 +1,10 @@
 ---
-project: <<Change-Me>>
+project: <<Change Me>>
 kind: PIPELINE
 name: Deploy GKE Cluster
 icon: organization,left, is-warning
 enabled: true
+description: Learn more about this vRA Code Stream Pipeline here - https://veducate.co.uk/vra-deploy-gke-cluster/
 concurrency: 10
 input:
   Add_to_Cloud_Assembly: 'Yes'
@@ -49,7 +50,7 @@ _inputMeta:
     mandatory: true
 workspace:
   type: DOCKER
-  endpoint: ''
+  endpoint: Dean-docker-host2
   image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
   registry: ''
   path: /workingDir
@@ -320,6 +321,7 @@ stages:
     tasks:
       Install TSM to Cluster:
         type: CI
+        preCondition: ${input.Add_to_TSM} == "Yes"
         input:
           steps:
           - kubectl apply -f ${Add GKE to TSM.Get TSM Onboarding URL.output.responseBody.url}
@@ -336,6 +338,7 @@ stages:
             ]
       Create Cluster in TSM:
         type: REST
+        preCondition: ${input.Add_to_TSM} == "Yes"
         input:
           action: put
           url: https://${var.gke-tsm-url}/tsm/v1alpha1/clusters/${input.Cluster_Name}?createOnly=true
@@ -364,6 +367,7 @@ stages:
           payload: ''
       Wait for TSM To be installed:
         type: CI
+        preCondition: ${input.Add_to_TSM} == "Yes"
         input:
           steps:
           - currentstatus=$(curl --location --request GET 'https://${var.gke-tsm-url}/tsm/v1alpha1/clusters/${input.Cluster_Name}'
@@ -392,6 +396,7 @@ stages:
             ]
       Get TSM Onboarding URL:
         type: REST
+        preCondition: ${input.Add_to_TSM} == "Yes"
         input:
           action: get
           url: https://${var.gke-tsm-url}/tsm/v1alpha1/clusters/onboard-url
