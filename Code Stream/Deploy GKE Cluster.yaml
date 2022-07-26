@@ -1,0 +1,402 @@
+---
+project: <<Change-Me>>
+kind: PIPELINE
+name: Deploy GKE Cluster
+icon: organization,left, is-warning
+enabled: true
+concurrency: 10
+input:
+  Add_to_Cloud_Assembly: 'Yes'
+  Add_to_Code_Stream: 'Yes'
+  Add_to_TMC: 'Yes'
+  Add_to_TSM: 'Yes'
+  Cluster_Name: ''
+  Google_Cloud_Project: ''
+  Google_Cloud_Region: us-central1
+  Machine_Type: e2-standard-8
+  Num_Nodes: '3'
+  vRA_Project: ''
+_inputMeta:
+  Google_Cloud_Region:
+    description: Specifies the Google Cloud region to send the request to.
+    mandatory: true
+  Add_to_TMC:
+    description: Add Cluster to Tanzu Mission Control = Yes or No
+    mandatory: true
+  Add_to_Cloud_Assembly:
+    description: Add Cluster to Cloud Assembly as K8s endpoint = Yes or No
+    mandatory: true
+  Google_Cloud_Project:
+    description: Provide the Google Cloud Project in which to deploy the cluster
+    mandatory: true
+  vRA_Project:
+    description: Provide the vRA Project to add the GKE Cluster to as an endpoint
+    mandatory: true
+  Add_to_TSM:
+    description: Add Cluster to Tanzu Service Mesh = Yes or No
+    mandatory: true
+  Add_to_Code_Stream:
+    description: Add Cluster to Code Stream as K8s endpoint = Yes or No
+    mandatory: true
+  Machine_Type:
+    description: Provide an instance size to use for the GKE cluster nodes
+    mandatory: true
+  Cluster_Name:
+    description: Provide a name for the EKS Cluster
+    mandatory: true
+  Num_Nodes:
+    description: The number of nodes to be created in each of the cluster's zones
+    mandatory: true
+workspace:
+  type: DOCKER
+  endpoint: ''
+  image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
+  registry: ''
+  path: /workingDir
+  autoCloneForTrigger: false
+  limits:
+    memory: 512
+    cpu: 1.0
+stageOrder:
+- Build Kubernetes Cluster
+- Add GKE Cluster to vRA
+- Add GKE to TMC
+- Add GKE to TSM
+stages:
+  Build Kubernetes Cluster:
+    taskOrder:
+    - Google Cloud Auth
+    - Build GKE Cluster
+    tasks:
+      Google Cloud Auth:
+        type: CI
+        input:
+          steps:
+          - echo ${var.google-cloud-auth} >> authdata.json
+          - ''
+          - base64 -d authdata.json >> auth.json
+          - ''
+          - 'gcloud auth activate-service-account --key-file auth.json  '
+          - ''
+          - rm -rf authdata.json
+          - rm -rf auth.json
+          - ''
+          - gcloud config set project ${input.Google_Cloud_Project}
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+      Build GKE Cluster:
+        type: CI
+        input:
+          steps:
+          - gcloud container clusters create ${input.Cluster_Name} --region ${input.Google_Cloud_Region}
+            --machine-type ${input.Machine_Type} --num-nodes ${input.Num_Nodes} --verbosity=debug
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+  Add GKE Cluster to vRA:
+    taskOrder:
+    - Create Cluster Service Account
+    - Create Role Binding,Install jq
+    - Get GKE Cluster details,Get vRA Cloud API Token
+    - Create Code Stream Endpoint,Create Cloud Assembly K8s Endpoint
+    tasks:
+      Install jq:
+        type: CI
+        input:
+          steps:
+          - apt install jq -y
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+      Create Cloud Assembly K8s Endpoint:
+        type: REST
+        preCondition: ${input.Add_to_Cloud_Assembly} == "Yes"
+        input:
+          action: post
+          url: https://api.mgmt.cloud.vmware.com/cmx/api/resources/k8s/clusters/
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+            Authorization: Bearer ${Add GKE Cluster to vRA.Get vRA Cloud API Token.output.responseBody.access_token}
+          payload: |-
+            {
+              "name": "${input.Cluster_Name}",
+              "description": "Cluster created from Pipeline execution ${executionId}",
+              "address": "${Add GKE Cluster to vRA.Get GKE Cluster details.output.exports.APISERVER}",
+              "credentials": {
+                "privateKey": "${Add GKE Cluster to vRA.Get GKE Cluster details.output.exports.TOKEN}",
+                "type": "Bearer"
+              },
+              "clusterType": "EXTERNAL",
+              "caCertificate": "${Add GKE Cluster to vRA.Get GKE Cluster details.output.exports.clusterCACertificate}",
+              "shared": "true",
+              "global": "true"
+            }
+      Create Role Binding:
+        type: CI
+        preCondition: ${input.Add_to_Code_Stream} == "Yes" || ${input.Add_to_Cloud_Assembly} == "Yes"
+        input:
+          steps:
+          - tee svc-rbac.yaml > /dev/null << EOF
+          - 'apiVersion: rbac.authorization.k8s.io/v1'
+          - 'kind: ClusterRoleBinding'
+          - 'metadata:'
+          - '  name: vra-admin'
+          - '  annotations:'
+          - '    createdBy: "vRA Pipeline execution ${executionId}"'
+          - 'roleRef:'
+          - '  apiGroup: rbac.authorization.k8s.io'
+          - '  kind: ClusterRole'
+          - '  name: cluster-admin'
+          - 'subjects:'
+          - '  - kind: ServiceAccount'
+          - '    name: vra-admin'
+          - '    namespace: kube-system'
+          - EOF
+          - ''
+          - kubectl apply -f svc-rbac.yaml
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+      Get GKE Cluster details:
+        type: CI
+        preCondition: ${input.Add_to_Code_Stream} == "Yes" || ${input.Add_to_Cloud_Assembly} == "Yes"
+        input:
+          steps:
+          - export APISERVER=$(kubectl config view --minify | grep server | cut -f 2- -d ":" | tr -d "
+            ")
+          - APISERVERNOHTTPS=$(echo $APISERVER | cut -c 9-)
+          - HTTPSPORT=443
+          - FPRINT=$(openssl s_client -connect $APISERVERNOHTTPS:$HTTPSPORT < /dev/null 2>/dev/null |
+            openssl x509 -fingerprint -sha256 -noout -in /dev/stdin)
+          - export FINGERPRINT=$(echo $FPRINT | cut -c 20-)
+          - TOKENNAME=$(kubectl -n kube-system get serviceaccount/vra-admin -o jsonpath='{.secrets[0].name}')
+          - export TOKEN=$(kubectl -n kube-system get secret $TOKENNAME -o jsonpath='{.data.token}'| base64
+            --decode)
+          - export clusterCACertificate=$(kubectl config view --minify --raw -o json | jq '.clusters[0].cluster["certificate-authority-data"]'
+            | sed 's/"//g' )
+          export:
+          - TOKEN
+          - FINGERPRINT
+          - APISERVER
+          - clusterCACertificate
+          artifacts: [
+            ]
+          process: [
+            ]
+      Create Code Stream Endpoint:
+        type: REST
+        preCondition: ${input.Add_to_Code_Stream} == "Yes"
+        input:
+          action: post
+          url: https://api.mgmt.cloud.vmware.com/pipeline/api/endpoints
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+            Authorization: Bearer ${Add GKE Cluster to vRA.Get vRA Cloud API Token.output.responseBody.access_token}
+          payload: |-
+            {
+              "project": "${input.vRA_Project}",
+              "kind": "ENDPOINT",
+              "name": "${input.Cluster_Name}",
+              "description": "Cluster Created From Pipeline execution ${executionId}",
+              "tags": [],
+              "type": "k8s",
+              "isRestricted": "false",
+              "cloudProxyId": "6bbc1cbb-b091-4c14-852b-a32ba5169150",
+              "properties": {
+                "kubernetesURL": "${Add GKE Cluster to vRA.Get GKE Cluster details.output.exports.APISERVER}",
+                "authType": "token",
+                "token": "${Add GKE Cluster to vRA.Get GKE Cluster details.output.exports.TOKEN}",
+                "fingerprint": "${Add GKE Cluster to vRA.Get GKE Cluster details.output.exports.FINGERPRINT}"
+              }
+            }
+      Get vRA Cloud API Token:
+        type: REST
+        preCondition: ${input.Add_to_Code_Stream} == "Yes" || ${input.Add_to_Cloud_Assembly} == "Yes"
+        input:
+          action: post
+          url: https://console.cloud.vmware.com/csp/gateway/am/api/auth/api-tokens/authorize?refresh_token=${var.vra-csp-token}
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+          payload: ''
+      Create Cluster Service Account:
+        type: CI
+        input:
+          steps:
+          - tee cluster_sa.yaml > /dev/null << EOF
+          - 'apiVersion: v1'
+          - 'kind: ServiceAccount'
+          - 'metadata:'
+          - '  name: vra-admin'
+          - '  namespace: kube-system'
+          - '  annotations:'
+          - '    createdBy: "vRA Pipeline execution ${executionId}"'
+          - EOF
+          - ''
+          - kubectl apply -f cluster_sa.yaml
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+  Add GKE to TMC:
+    taskOrder:
+    - Get TMC API Token
+    - Create TMC cluster attach task
+    - Install TMC to Cluster
+    tasks:
+      Create TMC cluster attach task:
+        type: REST
+        preCondition: ${input.Add_to_TMC} == "Yes"
+        input:
+          action: post
+          url: https://${var.gke-tmc-url}/v1alpha1/clusters
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+            Authorization: Bearer ${Add GKE to TMC.Get TMC API Token.output.responseBody.access_token}
+          payload: '{"cluster":{"fullName":{"managementClusterName":"attached","provisionerName":"attached","name":"${input.Cluster_Name}"},"meta":{},"spec":{"clusterGroupName":"default"}}}'
+      Install TMC to Cluster:
+        type: CI
+        preCondition: ${input.Add_to_TMC} == "Yes"
+        input:
+          steps:
+          - ''
+          - kubectl create -f "${Add GKE to TMC.Create TMC cluster attach task.output.responseBody.cluster.status.installerLink}"
+          - ''
+          - currentstatus=$(curl --location --request GET 'https://${var.gke-tmc-url}/v1alpha1/clusters/${input.Cluster_Name}?full_name.managementClusterName=attached&full_name.provisionerName=attached'
+            \
+          - '--header ''Authorization: Bearer ${Add GKE to TMC.Get TMC API Token.output.responseBody.access_token}''
+            | jq ''.cluster.status.health'' | sed ''s/"//g'' )'
+          - statusdone=HEALTHY
+          - while [ $currentstatus != $statusdone ]
+          - do
+          - '  echo "Waiting for Cluster to Synchronise with TMC"'
+          - '  sleep 15'
+          - '  currentstatus=$(curl --location --request GET ''https://${var.gke-tmc-url}/v1alpha1/clusters/${input.Cluster_Name}?full_name.managementClusterName=attached&full_name.provisionerName=attached''
+            \'
+          - '--header ''Authorization: Bearer ${Add GKE to TMC.Get TMC API Token.output.responseBody.access_token}''
+            | jq ''.cluster.status.health'' | sed ''s/"//g'' )'
+          - done
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+      Get TMC API Token:
+        type: REST
+        preCondition: ${input.Add_to_TMC} == "Yes"
+        input:
+          action: post
+          url: https://console.cloud.vmware.com/csp/gateway/am/api/auth/api-tokens/authorize?refresh_token=${var.tmc-csp-token}
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+          payload: ''
+  Add GKE to TSM:
+    taskOrder:
+    - Get TSM API Token
+    - Get TSM Onboarding URL
+    - Create Cluster in TSM
+    - Install TSM to Cluster
+    - Wait for TSM To be installed
+    tasks:
+      Install TSM to Cluster:
+        type: CI
+        input:
+          steps:
+          - kubectl apply -f ${Add GKE to TSM.Get TSM Onboarding URL.output.responseBody.url}
+          - ''
+          - kubectl -n vmware-system-tsm create secret generic cluster-token --from-literal=token=${Add
+            GKE to TSM.Create Cluster in TSM.output.responseBody.token}
+          - ''
+          - ''
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+      Create Cluster in TSM:
+        type: REST
+        input:
+          action: put
+          url: https://${var.gke-tsm-url}/tsm/v1alpha1/clusters/${input.Cluster_Name}?createOnly=true
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+            csp-auth-token: ${Add GKE to TSM.Get TSM API Token.output.responseBody.access_token}
+          payload: |-
+            {
+              "displayName": "${input.Cluster_Name}",
+              "description": "Onboarded by vRA Pipeline Execution ${executionId}",
+              "tags": [
+                ],
+              "autoInstallServiceMesh": true,
+              "enableNamespaceExclusions": false
+            }
+      Get TSM API Token:
+        type: REST
+        preCondition: ${input.Add_to_TSM} == "Yes"
+        input:
+          action: post
+          url: https://console.cloud.vmware.com/csp/gateway/am/api/auth/api-tokens/authorize?refresh_token=${var.tsm-csp-token}
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+          payload: ''
+      Wait for TSM To be installed:
+        type: CI
+        input:
+          steps:
+          - currentstatus=$(curl --location --request GET 'https://${var.gke-tsm-url}/tsm/v1alpha1/clusters/${input.Cluster_Name}'
+            \
+          - '--header ''csp-auth-token: ${Add GKE to TSM.Get TSM API Token.output.responseBody.access_token}''
+            | jq ''.status.state'' | sed ''s/"//g'' )'
+          - ''
+          - echo $currentstatus
+          - ''
+          - export statusdone='Ready'
+          - ''
+          - while [ $currentstatus != $statusdone ]
+          - do
+          - '  echo "Waiting for Cluster to Synchronise with TSM, current status = $currentstatus"'
+          - '  sleep 45'
+          - '  currentstatus=$(curl --location --request GET ''https://${var.gke-tsm-url}/tsm/v1alpha1/clusters/${input.Cluster_Name}''
+            \'
+          - '--header ''csp-auth-token: ${Add GKE to TSM.Get TSM API Token.output.responseBody.access_token}''
+            | jq ''.status.state'' | sed ''s/"//g'' )'
+          - done
+          export: [
+            ]
+          artifacts: [
+            ]
+          process: [
+            ]
+      Get TSM Onboarding URL:
+        type: REST
+        input:
+          action: get
+          url: https://${var.gke-tsm-url}/tsm/v1alpha1/clusters/onboard-url
+          headers:
+            Accept: application/json
+            Content-Type: application/json
+            csp-auth-token: ${Add GKE to TSM.Get TSM API Token.output.responseBody.access_token}
+          payload: ''
